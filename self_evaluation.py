@@ -5,12 +5,18 @@
 的计算规则；用 COCO RLE 计算重叠，避免展开大量 2048×2048 float32 实例。
 没有改用 Hungarian 匹配；多对多计数遵循 notebook 的实现。
 """
-import argparse
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from pycocotools import mask as mask_util
+from tqdm.auto import tqdm
+
+from output import predict_probability, probability_to_rles
+from prepare import ROOT, annotation_rle, read_gray
+
+GROUND_TRUTH_CSV = ROOT / 'csv/ground_truth.csv'
+PREDICTION_CSV = ROOT / 'csv/prediction.csv'
 
 
 def overlap_matrices(gt_rles, pred_rles):
@@ -75,16 +81,20 @@ def get_overlap_df(gt_df, pred_df, height=2048, width=2048):
 
 
 def evaluate_model(model, records, annotations, image_dir, device,
-                   tile_size=512, batch_size=4, threshold=0.5, min_area=16):
-    from pipeline import annotation_rle, predict_image, read_gray, instance_rles
+                   tile_size=512, batch_size=4, threshold=0.5, min_area=16,
+                   description='Evaluate'):
     # 同一原图只推理一次，再分别与各标注者对比。
     by_file = {}
     for record in records:
         by_file.setdefault(record['file_name'], []).append(record)
     rows = []
-    for filename, entries in by_file.items():
-        probability = predict_image(model, read_gray(Path(image_dir) / filename), device, tile_size, batch_size)
-        pred = instance_rles(probability, threshold, min_area)
+    image_dir = Path(image_dir)
+    images = tqdm(by_file.items(), desc=description, leave=False, dynamic_ncols=True)
+    for filename, entries in images:
+        probability = predict_probability(
+            model, read_gray(image_dir / filename), device, tile_size, batch_size,
+        )
+        pred = probability_to_rles(probability, threshold, min_area)
         for record in entries:
             gt = [annotation_rle(a, record['height'], record['width'])
                   for a in annotations[record['image_id']]]
@@ -95,13 +105,11 @@ def evaluate_model(model, records, annotations, image_dir, device,
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--ground-truth', required=True, type=Path)
-    parser.add_argument('--prediction', required=True, type=Path)
-    args = parser.parse_args()
     import json
-    frame = get_overlap_df(pd.read_csv(args.ground_truth, keep_default_na=False),
-                           pd.read_csv(args.prediction, keep_default_na=False))
+    frame = get_overlap_df(
+        pd.read_csv(GROUND_TRUTH_CSV, keep_default_na=False),
+        pd.read_csv(PREDICTION_CSV, keep_default_na=False),
+    )
     print(json.dumps(summarize(frame), indent=2))
 
 

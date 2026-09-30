@@ -1,5 +1,4 @@
 """自动加载 model 中数字版本号最高的分割模型，导出比赛 COCO RLE CSV。"""
-import argparse
 import csv
 import json
 import re
@@ -8,7 +7,18 @@ from pathlib import Path
 import torch
 
 from models import build_model
-from pipeline import ROOT, instance_rles, predict_image, read_gray, rle_rows
+from output import predict_probability, probability_to_rles, rle_rows
+from prepare import ROOT, read_gray
+
+MODEL_DIR = ROOT / 'model'
+CHECKPOINT = None       # 例如 ROOT / 'model/tiny_unet_v0001.pt'；None 自动选最新版本
+TEST_DIR = ROOT / 'data/test/test_images'
+OUTPUT_DIR = ROOT / 'csv'
+BATCH_SIZE = 4
+THREADS = 4
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+THRESHOLD = None       # None 表示沿用模型训练配置
+MIN_AREA = None        # None 表示沿用模型训练配置
 
 
 def latest_checkpoint(model_dir):
@@ -22,43 +32,33 @@ def latest_checkpoint(model_dir):
     version = max(v for v, _ in candidates)
     paths = [p for v, p in candidates if v == version]
     if len(paths) != 1:
-        raise ValueError(f'最高版本 {version} 存在多个文件，请使用 --checkpoint 指定')
+        raise ValueError(f'最高版本 {version} 存在多个文件，请设置 CHECKPOINT')
     return paths[0]
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model-dir', type=Path, default=ROOT / 'model')
-    parser.add_argument('--checkpoint', type=Path)
-    parser.add_argument('--test-dir', type=Path, default=ROOT / 'data/test/test_images')
-    parser.add_argument('--output-dir', type=Path, default=ROOT / 'csv')
-    parser.add_argument('--batch-size', type=int, default=4)
-    parser.add_argument('--threads', type=int, default=4)
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--threshold', type=float, help='默认沿用模型训练配置')
-    parser.add_argument('--min-area', type=int, help='默认沿用模型训练配置')
-    args = parser.parse_args()
-    if args.batch_size <= 0 or args.threads <= 0:
-        parser.error('batch-size 和 threads 必须为正整数')
-    torch.set_num_threads(args.threads)
-    path = args.checkpoint or latest_checkpoint(args.model_dir)
+    if BATCH_SIZE <= 0 or THREADS <= 0:
+        raise ValueError('BATCH_SIZE 和 THREADS 必须为正整数')
+    torch.set_num_threads(THREADS)
+    path = Path(CHECKPOINT) if CHECKPOINT is not None else latest_checkpoint(MODEL_DIR)
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     if checkpoint.get('task') != 'segmentation' or checkpoint.get('format_version') != 1:
         raise ValueError('不是本项目的分割 checkpoint')
     config = checkpoint['config']
-    threshold = config['threshold'] if args.threshold is None else args.threshold
-    min_area = config['min_area'] if args.min_area is None else args.min_area
+    threshold = config['threshold'] if THRESHOLD is None else THRESHOLD
+    min_area = config['min_area'] if MIN_AREA is None else MIN_AREA
     if not 0 < threshold < 1 or min_area < 1:
-        parser.error('threshold 必须在 (0,1)，min-area 必须为正整数')
-    model = build_model(checkpoint['model_name']).to(args.device)
+        raise ValueError('THRESHOLD 必须在 (0,1)，MIN_AREA 必须为正整数')
+    model = build_model(checkpoint['model_name']).to(DEVICE)
     model.load_state_dict(checkpoint['state_dict'])
-    files = sorted(p for p in args.test_dir.iterdir() if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'})
+    files = sorted(p for p in TEST_DIR.iterdir()
+                   if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'})
     if not files:
-        raise FileNotFoundError(f'没有测试图片: {args.test_dir}')
+        raise FileNotFoundError(f'没有测试图片: {TEST_DIR}')
     if len({p.stem for p in files}) != len(files):
         raise ValueError('测试图片存在同名 stem，无法生成唯一 filament_id')
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output = args.output_dir / f'submission_{checkpoint["model_name"]}_v{checkpoint["version"]:04d}.csv'
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output = OUTPUT_DIR / f'submission_{checkpoint["model_name"]}_v{checkpoint["version"]:04d}.csv'
     temporary = output.with_suffix('.csv.tmp')
     empty, row_count = [], 0
     try:
@@ -69,8 +69,13 @@ def main():
                 image = read_gray(image_path)
                 if image.shape != (2048, 2048):
                     raise ValueError(f'比赛要求 2048×2048，得到 {image.shape}: {image_path}')
-                probability = predict_image(model, image, args.device, config['tile_size'], args.batch_size)
-                rows = rle_rows(image_path.stem, instance_rles(probability, threshold, min_area))
+                probability = predict_probability(
+                    model, image, DEVICE, config['tile_size'], BATCH_SIZE,
+                )
+                rows = rle_rows(
+                    image_path.stem,
+                    probability_to_rles(probability, threshold, min_area),
+                )
                 writer.writerows(rows)
                 row_count += len(rows)
                 if not rows:

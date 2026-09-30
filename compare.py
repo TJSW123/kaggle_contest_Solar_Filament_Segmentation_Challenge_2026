@@ -1,4 +1,4 @@
-"""用真实分割区域训练，按完整原图的验证 PQ 比较不同 CNN。"""
+"""用相同设置微调并比较不同 ImageNet 预训练编码器的 U-Net。"""
 import json
 
 import numpy as np
@@ -14,9 +14,9 @@ IMAGE_DIR = ROOT / 'data/train/train_images'
 OUTPUT_DIR = ROOT / 'reports/compare'
 MODELS = MODEL_NAMES
 EPOCHS = 5
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 TILE_SIZE = 512
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 VAL_FRACTION = 0.2
 SEED = 42
 DEVICE = 'cuda'
@@ -27,7 +27,8 @@ MIN_AREA = 16
 def comparison_config():
     return dict(
         processed=str(PROCESSED), image_dir=str(IMAGE_DIR),
-        models=list(MODELS), output_dir=str(OUTPUT_DIR), epochs=EPOCHS,
+        models=list(MODELS), encoder_weights='ImageNet1K_DEFAULT',
+        output_dir=str(OUTPUT_DIR), epochs=EPOCHS,
         batch_size=BATCH_SIZE, tile_size=TILE_SIZE, lr=LEARNING_RATE,
         val_fraction=VAL_FRACTION, seed=SEED, device=DEVICE,
         threshold=THRESHOLD, min_area=MIN_AREA,
@@ -54,7 +55,7 @@ def plot_comparison(results):
     loss_ax.set_title('Loss at the selected epoch')
     loss_ax.legend()
 
-    fig.suptitle(f'Segmentation comparison: {EPOCHS} epochs per model')
+    fig.suptitle(f'Pretrained encoder + U-Net comparison: {EPOCHS} epochs per model')
     fig.tight_layout()
     fig.savefig(OUTPUT_DIR / 'comparison.png', dpi=160)
     plt.close(fig)

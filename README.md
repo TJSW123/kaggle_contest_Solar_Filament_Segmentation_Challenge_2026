@@ -1,6 +1,6 @@
 # Solar Filament Segmentation：PyTorch 入门基线
 
-本项目使用灰度图、512×512 切块和小型 U-Net 系列网络。默认路径相对于脚本目录，不需要修改源代码。原始数据不会被覆盖。
+本项目使用灰度图、512×512 切块和“ImageNet 预训练 ResNet 编码器 + U-Net 解码器”。默认路径相对于脚本目录，不需要修改源代码。原始数据不会被覆盖。
 
 ## 安装和运行
 
@@ -14,18 +14,18 @@ python train.py
 python result.py
 ```
 
-所有用户配置都集中在各脚本顶部的大写常量中，不使用命令行参数。`compare.py` 初选模型后，把结果写入 `train.py` 顶部的 `MODEL_NAME`。可选 `tiny_unet`、`unet`、`resunet`。这三个模型都从头训练，不会下载预训练权重。训练固定使用 CUDA；CUDA 不可用时直接报错，不会静默回退到 CPU。训练、loss 计算和完整原图 PQ 评估均显示进度条。
+所有用户配置都集中在各脚本顶部的大写常量中，不使用命令行参数。`compare.py` 初选编码器后，把结果写入 `train.py` 顶部的 `MODEL_NAME`。可选 `resnet18_unet`、`resnet34_unet`、`resnet50_unet`。首次构建模型时 torchvision 会下载对应的 ImageNet 预训练权重，之后使用本机缓存；编码器和 U-Net 解码器一起微调。训练固定使用 CUDA；CUDA 不可用时直接报错，不会静默回退到 CPU。训练、loss 计算和完整原图 PQ 评估均显示进度条。
 
 ## 各文件的作用
 
 - `data/data_processsing.py`：读取原始 COCO JSON，生成 `data/train/processed.json`。每项只有 `image_id`、`segmentation`、`bbox`，`image_id` 保持原始的「标注者-图像名」。
-- `compare.py`：使用全部原图，统一划分、随机种子、损失函数、训练轮数和 batch 顺序，训练三个分割网络；每轮评估验证 PQ，选出各模型最佳轮次，再比较模型。输出 `reports/compare/comparison.png`（PQ 和最佳轮次的 loss）以及包含每轮记录、最佳轮次、配置、划分的 `comparison.json`，不保存模型权重。
+- `compare.py`：使用全部原图，统一划分、随机种子、损失函数、训练轮数和 batch 顺序，微调三个预训练 ResNet 编码器 + 相同结构的 U-Net 解码器；每轮评估验证 PQ，选出各模型最佳轮次，再比较基础模型。输出 `reports/compare/comparison.png`（PQ 和最佳轮次的 loss）以及包含每轮记录、最佳轮次、配置、划分的 `comparison.json`，不保存模型权重。
 - `train.py`：用分割区域训练。每轮训练后，在无随机增强、eval 模式下计算训练及验证 loss，并在拼接后的完整原图上计算训练及验证 PQ。
 - `prepare.py`：加载标注、划分训练/验证集、生成 mask、切块并构建 DataLoader，同时提供共享 loss 和单轮训练接口。
 - `output.py`：分块推理并拼接完整概率图，再按阈值和最小面积提取八连通实例并编码为 RLE。
 - `self_evaluation.py`：提供 `evaluate_model`、`get_overlap_df`、`get_pq_score` 接口，返回 PQ、TP/FP/FN、一对多/多对一数量、正重叠配对的平均 Dice。该 Dice 是诊断值，不是排行榜指标。
 - `result.py`：选取 `model/` 中数字版本号最高的 `<模型>_v<版本>.pt`，对测试图像预测，生成 `csv/submission_<模型>_v<版本>.csv` 和推理摘要 JSON。
-- `models.py`：三个无需下载预训练权重的单通道分割网络。
+- `models.py`：三个 ImageNet 预训练 ResNet 编码器 + U-Net 解码器；在模型内部把单通道复制为 RGB 并执行 ImageNet 归一化。
 
 ## 数据格式与标注者
 
@@ -79,7 +79,7 @@ GT 的 `filament_id` 应为 `标注者-图像名_实例号`，预测为 `图像�
 
 ## 模型版本与产物
 
-每次训练在 `model/` 中取全局数字版本号加一，例如 `tiny_unet_v0001.pt`、`resunet_v0002.pt`。同一次训练保留验证 PQ 最高的轮次，同分时选验证 loss 更低的轮次。版本代表一次训练运行，**不代表模型一定更好**。`result.py` 默认选择最新版本；需要手动指定时，设置脚本顶部的 `CHECKPOINT`。
+每次训练在 `model/` 中取全局数字版本号加一，例如 `resnet18_unet_v0001.pt`、`resnet50_unet_v0002.pt`。同一次训练保留验证 PQ 最高的轮次，同分时选验证 loss 更低的轮次。版本代表一次训练运行，**不代表模型一定更好**。`result.py` 默认选择最新版本；需要手动指定时，设置脚本顶部的 `CHECKPOINT`。
 
 每个版本还有 `<模型>_v<版本>_history.png`（两张子图：训练/验证 loss 和 PQ）及 `_history.json`（每轮其他评价值、配置和原图划分）。阈值与最小连通域面积默认分别为 0.5、16 像素，保存到 checkpoint；推理沿用相同配置。可通过脚本顶部的 `THRESHOLD`、`MIN_AREA` 调整，但应依据验证集选择。
 

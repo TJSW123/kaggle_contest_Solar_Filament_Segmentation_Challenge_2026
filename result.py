@@ -11,7 +11,7 @@ from output import predict_probability, probability_to_rles, rle_rows
 from prepare import ROOT, read_gray
 
 MODEL_DIR = ROOT / 'model'
-CHECKPOINT = None       # 例如 ROOT / 'model/tiny_unet_v0001.pt'；None 自动选最新版本
+CHECKPOINT = None       # 例如 ROOT / 'model/resnet18_unet_v0001.pt'；None 自动选最新版本
 TEST_DIR = ROOT / 'data/test/test_images'
 OUTPUT_DIR = ROOT / 'csv'
 BATCH_SIZE = 4
@@ -49,7 +49,8 @@ def main():
     min_area = config['min_area'] if MIN_AREA is None else MIN_AREA
     if not 0 < threshold < 1 or min_area < 1:
         raise ValueError('THRESHOLD 必须在 (0,1)，MIN_AREA 必须为正整数')
-    model = build_model(checkpoint['model_name']).to(DEVICE)
+    # checkpoint 已包含编码器权重，推理时不应再下载 ImageNet 权重。
+    model = build_model(checkpoint['model_name'], pretrained=False).to(DEVICE)
     model.load_state_dict(checkpoint['state_dict'])
     files = sorted(p for p in TEST_DIR.iterdir()
                    if p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.tif', '.tiff'})

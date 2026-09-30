@@ -1,4 +1,4 @@
-"""训练灰度图分割模型，按原图验证，每轮保存 loss / 官方 PQ 曲线。"""
+"""微调预训练编码器 + U-Net，按原图验证并保存 loss / 官方 PQ 曲线。"""
 import json
 import re
 from pathlib import Path
@@ -16,11 +16,11 @@ from self_evaluation import evaluate_model
 PROCESSED = ROOT / 'data/train/processed.json'
 IMAGE_DIR = ROOT / 'data/train/train_images'
 MODEL_DIR = ROOT / 'model'
-MODEL_NAME = 'tiny_unet'
+MODEL_NAME = 'resnet18_unet'
 EPOCHS = 20
-BATCH_SIZE = 4
+BATCH_SIZE = 2
 TILE_SIZE = 512
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 VAL_FRACTION = 0.2
 SEED = 42
 DEVICE = 'cuda'
@@ -68,6 +68,7 @@ def plot_history(history, path):
 def training_config():
     return dict(
         processed=str(PROCESSED), image_dir=str(IMAGE_DIR), model=MODEL_NAME,
+        encoder_weights='ImageNet1K_DEFAULT',
         epochs=EPOCHS, batch_size=BATCH_SIZE, tile_size=TILE_SIZE,
         lr=LEARNING_RATE, val_fraction=VAL_FRACTION, seed=SEED,
         device=DEVICE, threshold=THRESHOLD, min_area=MIN_AREA,

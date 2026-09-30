@@ -6,4 +6,5 @@ model/*.pt
 csv/*.csv
 
 data/train/train_images/
+data/train/mask_cache/
 data/test/test_images/

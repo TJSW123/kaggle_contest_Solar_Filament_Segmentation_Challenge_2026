@@ -1,7 +1,9 @@
 """训练前的数据读取、划分、切块和 DataLoader 构建。"""
 import json
+import os
 import random
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -9,10 +11,12 @@ import cv2
 import numpy as np
 import torch
 from pycocotools import mask as mask_util
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parent
+MASK_CACHE_DIR = ROOT / 'data/train/mask_cache'
+NUM_WORKERS = min(8, max(0, (os.cpu_count() or 2) - 2))
 
 
 def seed_everything(seed):
@@ -21,6 +25,7 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
 
 
 def load_data(processed):
@@ -70,11 +75,68 @@ def make_mask(record, annotations):
     return mask
 
 
+def _mask_cache_path(image_id):
+    return MASK_CACHE_DIR / f'{image_id}.npy'
+
+
+def _build_one_mask(item):
+    image_id, height, width, annotations = item
+    path = _mask_cache_path(image_id)
+    if path.is_file():
+        return image_id
+    record = dict(image_id=image_id, height=height, width=width)
+    np.save(path, make_mask(record, annotations))
+    return image_id
+
+
+def ensure_mask_cache(records, annotations):
+    """把多边形标注预渲染成 uint8 mask，避免训练时反复解码。"""
+    MASK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    pending = [
+        (record['image_id'], record['height'], record['width'], annotations[record['image_id']])
+        for record in records
+        if not _mask_cache_path(record['image_id']).is_file()
+    ]
+    if not pending:
+        return
+    workers = min(NUM_WORKERS or 4, len(pending))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        list(tqdm(
+            pool.map(_build_one_mask, pending, chunksize=4),
+            total=len(pending),
+            desc='Cache masks',
+            dynamic_ncols=True,
+        ))
+
+
 def read_gray(path):
     image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise FileNotFoundError(f'不能读取图像: {path}')
     return image
+
+
+class RecordShuffleSampler(Sampler):
+    """先打乱原图，再依次输出该图全部切块，避免 mask/图像缓存失效。"""
+
+    def __init__(self, n_records, tiles_per_image, seed=42, shuffle=True):
+        self.n_records = n_records
+        self.tiles_per_image = tiles_per_image
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+
+    def __len__(self):
+        return self.n_records * self.tiles_per_image
+
+    def __iter__(self):
+        order = list(range(self.n_records))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(order)
+        self.epoch += 1
+        for record_index in order:
+            start = record_index * self.tiles_per_image
+            yield from range(start, start + self.tiles_per_image)
 
 
 class TileDataset(Dataset):
@@ -86,6 +148,7 @@ class TileDataset(Dataset):
         self.image_dir = Path(image_dir)
         self.tile_size = tile_size
         self.augment = augment
+        self.tiles_per_image = (records[0]['height'] // tile_size) * (records[0]['width'] // tile_size)
         self.tiles = [
             (index, y, x)
             for index, record in enumerate(records)
@@ -93,11 +156,11 @@ class TileDataset(Dataset):
             for x in range(0, record['width'], tile_size)
         ]
 
-    @lru_cache(maxsize=4)
+    @lru_cache(maxsize=32)
     def full_image(self, index):
         record = self.records[index]
         image = read_gray(self.image_dir / record['file_name'])
-        mask = make_mask(record, self.annotations[record['image_id']])
+        mask = np.load(_mask_cache_path(record['image_id']), mmap_mode='r')
         return image, mask
 
     def __len__(self):
@@ -109,12 +172,19 @@ class TileDataset(Dataset):
         size = self.tile_size
         crop = image[y:y + size, x:x + size]
         h, w = crop.shape
-        inputs = np.zeros((size, size), np.float32)
-        targets = np.zeros_like(inputs)
-        valid = np.zeros_like(inputs)
-        inputs[:h, :w] = crop / 255.0
-        targets[:h, :w] = mask[y:y + h, x:x + w]
-        valid[:h, :w] = 1
+        inputs = np.empty((size, size), np.float32)
+        targets = np.zeros((size, size), np.float32)
+        valid = np.zeros((size, size), np.float32)
+        if h == size and w == size:
+            inputs[...] = crop
+            inputs /= 255.0
+            targets[...] = mask[y:y + size, x:x + size]
+            valid[...] = 1
+        else:
+            inputs.fill(0)
+            inputs[:h, :w] = crop / 255.0
+            targets[:h, :w] = mask[y:y + h, x:x + w]
+            valid[:h, :w] = 1
         if self.augment:
             for axis in (0, 1):
                 if random.random() < 0.5:
@@ -122,7 +192,7 @@ class TileDataset(Dataset):
                         np.flip(array, axis=axis) for array in (inputs, targets, valid)
                     ]
         return tuple(
-            torch.from_numpy(array.copy()).unsqueeze(0)
+            torch.from_numpy(np.ascontiguousarray(array)).unsqueeze(0)
             for array in (inputs, targets, valid)
         )
 
@@ -133,6 +203,7 @@ def build_loaders(processed, image_dir, tile_size, batch_size, val_fraction,
     images, annotations = load_data(processed)
     train_records, val_records = split_images(images, val_fraction, seed)
     image_dir = Path(image_dir)
+    ensure_mask_cache(train_records + val_records, annotations)
 
     dataset_options = dict(
         annotations=annotations,
@@ -141,22 +212,34 @@ def build_loaders(processed, image_dir, tile_size, batch_size, val_fraction,
     )
     loader_options = dict(
         batch_size=batch_size,
+        num_workers=NUM_WORKERS,
         pin_memory=str(device).startswith('cuda'),
+        persistent_workers=NUM_WORKERS > 0,
     )
+    if NUM_WORKERS > 0:
+        loader_options['prefetch_factor'] = 4
+    train_set = TileDataset(train_records, augment=True, **dataset_options)
+    train_eval_set = TileDataset(train_records, **dataset_options)
+    val_set = TileDataset(val_records, **dataset_options)
     training = DataLoader(
-        TileDataset(train_records, augment=True, **dataset_options),
-        shuffle=True,
-        generator=torch.Generator().manual_seed(seed),
+        train_set,
+        sampler=RecordShuffleSampler(
+            len(train_records), train_set.tiles_per_image, seed=seed, shuffle=True,
+        ),
         **loader_options,
     )
     train_eval = DataLoader(
-        TileDataset(train_records, **dataset_options),
-        shuffle=False,
+        train_eval_set,
+        sampler=RecordShuffleSampler(
+            len(train_records), train_eval_set.tiles_per_image, seed=seed, shuffle=False,
+        ),
         **loader_options,
     )
     validation = DataLoader(
-        TileDataset(val_records, **dataset_options),
-        shuffle=False,
+        val_set,
+        sampler=RecordShuffleSampler(
+            len(val_records), val_set.tiles_per_image, seed=seed, shuffle=False,
+        ),
         **loader_options,
     )
     return train_records, val_records, annotations, (training, train_eval, validation)

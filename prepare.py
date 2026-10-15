@@ -17,6 +17,10 @@ from tqdm.auto import tqdm
 ROOT = Path(__file__).resolve().parent
 MASK_CACHE_DIR = ROOT / 'data/train/mask_cache'
 NUM_WORKERS = min(8, max(0, (os.cpu_count() or 2) - 2))
+FOCAL_GAMMA = 2.0
+FOCAL_FOREGROUND_WEIGHT = 0.3
+TVERSKY_FP_WEIGHT = 0.7
+TVERSKY_FN_WEIGHT = 0.3
 
 
 def seed_everything(seed):
@@ -245,41 +249,108 @@ def build_loaders(processed, image_dir, tile_size, batch_size, val_fraction,
     return train_records, val_records, annotations, (training, train_eval, validation)
 
 
-def segmentation_loss(logits, target, valid):
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+def segmentation_loss(logits, target, valid, return_components=False):
+    """类别平衡 Focal BCE，加上偏重惩罚假阳性的 Tversky loss。"""
+    pixel_bce = torch.nn.functional.binary_cross_entropy_with_logits(
         logits, target, reduction='none'
     )
-    bce = (bce * valid).sum((1, 2, 3)) / valid.sum((1, 2, 3)).clamp_min(1)
-    probabilities = logits.sigmoid() * valid
-    truth = target * valid
-    dice = (2 * (probabilities * truth).sum((1, 2, 3)) + 1) / (
-        probabilities.sum((1, 2, 3)) + truth.sum((1, 2, 3)) + 1
+    probabilities = logits.sigmoid()
+    target_probability = probabilities * target + (1 - probabilities) * (1 - target)
+    pixel_focal_bce = (1 - target_probability).pow(FOCAL_GAMMA) * pixel_bce
+
+    foreground = target * valid
+    background = (1 - target) * valid
+    foreground_pixels = foreground.sum((1, 2, 3))
+    background_pixels = background.sum((1, 2, 3))
+    foreground_focal = (
+        (pixel_focal_bce * foreground).sum((1, 2, 3))
+        / foreground_pixels.clamp_min(1)
     )
-    return (bce + 1 - dice).mean()
+    background_focal = (
+        (pixel_focal_bce * background).sum((1, 2, 3))
+        / background_pixels.clamp_min(1)
+    )
+    has_foreground = foreground_pixels > 0
+    focal_bce = torch.where(
+        has_foreground,
+        (
+            FOCAL_FOREGROUND_WEIGHT * foreground_focal
+            + (1 - FOCAL_FOREGROUND_WEIGHT) * background_focal
+        ),
+        background_focal,
+    )
+
+    probabilities = probabilities * valid
+    true_positive = (probabilities * foreground).sum((1, 2, 3))
+    false_positive = (probabilities * background).sum((1, 2, 3))
+    false_negative = ((1 - probabilities) * foreground).sum((1, 2, 3))
+    tversky = (true_positive + 1) / (
+        true_positive
+        + TVERSKY_FP_WEIGHT * false_positive
+        + TVERSKY_FN_WEIGHT * false_negative
+        + 1
+    )
+    tversky_loss = (1 - tversky)[has_foreground]
+    focal_bce_loss = focal_bce.mean()
+    tversky_loss = (
+        tversky_loss.mean() if tversky_loss.numel() else logits.sum() * 0
+    )
+    total_loss = focal_bce_loss + tversky_loss
+    if return_components:
+        return dict(
+            loss=total_loss,
+            focal_bce=focal_bce_loss,
+            tversky=tversky_loss,
+        )
+    return total_loss
 
 
-def run_epoch(model, loader, device, optimizer=None, description=''):
-    """训练一轮；未传 optimizer 时只计算平均 loss。"""
+def run_epoch(model, loader, device, optimizer=None, description='', accum_steps=1,
+              return_components=False):
+    """训练一轮；未传 optimizer 时只计算平均 loss。
+
+    accum_steps>1 时先累加多步梯度再更新，等效 batch 约为 loader batch 的 accum_steps 倍。
+    return_components=True 时同时返回 total、Focal BCE 和 Tversky 的轮平均值。
+    """
+    if accum_steps < 1:
+        raise ValueError('accum_steps 必须 >= 1')
     model.train(optimizer is not None)
-    total = 0.0
+    totals = dict(loss=0.0, focal_bce=0.0, tversky=0.0)
     count = 0
+    pending = 0
     batches = tqdm(
         loader, desc=description,
         leave=optimizer is not None, dynamic_ncols=True,
     )
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
     with torch.set_grad_enabled(optimizer is not None):
         for inputs, target, valid in batches:
             inputs, target, valid = (
                 tensor.to(device, non_blocking=True)
                 for tensor in (inputs, target, valid)
             )
+            losses = segmentation_loss(
+                model(inputs), target, valid, return_components=True,
+            )
+            loss = losses['loss']
             if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-            loss = segmentation_loss(model(inputs), target, valid)
-            if optimizer is not None:
-                loss.backward()
-                optimizer.step()
-            total += float(loss.detach()) * len(inputs)
+                (loss / accum_steps).backward()
+                pending += 1
+                if pending == accum_steps:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    pending = 0
+            for name, value in losses.items():
+                totals[name] += float(value.detach()) * len(inputs)
             count += len(inputs)
-            batches.set_postfix(loss=f'{total / count:.4f}')
-    return total / count
+            batches.set_postfix(loss=f'{totals["loss"] / count:.4f}')
+    if optimizer is not None and pending:
+        scale = accum_steps / pending
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.mul_(scale)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    averages = {name: value / count for name, value in totals.items()}
+    return averages if return_components else averages['loss']

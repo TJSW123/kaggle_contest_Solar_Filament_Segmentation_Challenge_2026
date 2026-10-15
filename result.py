@@ -11,7 +11,7 @@ from output import predict_probability, probability_to_rles, rle_rows
 from prepare import ROOT, read_gray
 
 MODEL_DIR = ROOT / 'model'
-CHECKPOINT = None       # 例如 ROOT / 'model/resnet18_unet_v0001.pt'；None 自动选最新版本
+CHECKPOINT = None       # 例如 ROOT / 'model/resnet18/resnet18_unet_v0001.pt'；None 自动选最新版本
 TEST_DIR = ROOT / 'data/test/test_images'
 OUTPUT_DIR = ROOT / 'csv'
 BATCH_SIZE = 4
@@ -23,7 +23,7 @@ MIN_AREA = None        # None 表示沿用模型训练配置
 
 def latest_checkpoint(model_dir):
     candidates = []
-    for path in Path(model_dir).glob('*.pt'):
+    for path in Path(model_dir).rglob('*.pt'):
         match = re.fullmatch(r'(.+)_v(\d+)\.pt', path.name)
         if match:
             candidates.append((int(match.group(2)), path))

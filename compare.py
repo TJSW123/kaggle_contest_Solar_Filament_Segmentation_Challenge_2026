@@ -51,7 +51,7 @@ def plot_comparison(results):
         bars = loss_ax.bar(x + offset, [row[key] for row in results], 0.36, label=label)
         loss_ax.bar_label(bars, fmt='%.4f')
     loss_ax.set_xticks(x, labels)
-    loss_ax.set_ylabel('Segmentation BCE + Dice loss')
+    loss_ax.set_ylabel('Segmentation Focal BCE + Tversky loss')
     loss_ax.set_title('Loss at the selected epoch')
     loss_ax.legend()
 
